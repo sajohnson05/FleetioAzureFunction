@@ -381,7 +381,7 @@ def sync_service_reminders(run_date):
 # ==================================================
 
 @app.schedule(
-    schedule="0 0 5 * * *",
+    schedule="0 0 10 * * *",
     arg_name="mytimer",
     run_on_startup=False,
     use_monitor=True
