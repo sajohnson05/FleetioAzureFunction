@@ -1,0 +1,12 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FLEETIO_API_KEY": "",
+    "FLEETIO_ACCOUNT_TOKEN": "",
+    "FLEETIO_BASE_URL": "https://secure.fleetio.com/api/v1",
+    "BLOB_CONNECTION_STRING": "YOUR_BLOB_CONNECTION_STRING",
+    "BLOB_CONTAINER": "fleetio-raw"
+  }
+}
