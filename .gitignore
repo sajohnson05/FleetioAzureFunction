@@ -6,7 +6,6 @@ __pycache__/
 .python_packages/
 .env
 
-.vscode/
 
 local.settings.json
 
