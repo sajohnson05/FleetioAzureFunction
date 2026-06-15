@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceNotFoundError
 from dotenv import load_dotenv
 
 
@@ -69,6 +70,22 @@ def get_latest_blob(container_name, endpoint_name, file_name):
     matching.sort(reverse=True)
     return matching[0]
 
+def get_all_blobs(container_name, endpoint_name, file_name):
+    prefix = f"{endpoint_name}/"
+    blobs = list_blobs(container_name, prefix)
+
+    matching = [
+        b.name for b in blobs
+        if b.name.endswith(f"/{file_name}")
+    ]
+
+    if not matching:
+        raise FileNotFoundError(
+            f"No blobs found for {endpoint_name}/{file_name}"
+        )
+
+    matching.sort()
+    return matching
 
 def download_json(container_name, blob_name):
     client = blob_service().get_blob_client(
@@ -78,6 +95,20 @@ def download_json(container_name, blob_name):
 
     raw = client.download_blob().readall()
     return json.loads(raw)
+
+
+def download_parquet_if_exists(container_name, blob_name):
+    client = blob_service().get_blob_client(
+        container=container_name,
+        blob=blob_name
+    )
+
+    try:
+        raw = client.download_blob().readall()
+        return pd.read_parquet(BytesIO(raw), engine="pyarrow")
+    except ResourceNotFoundError:
+        logging.info("No existing curated parquet found at %s/%s", container_name, blob_name)
+        return None
 
 
 def upload_parquet(container_name, blob_name, df):
@@ -98,6 +129,36 @@ def upload_parquet(container_name, blob_name, df):
         container_name,
         blob_name
     )
+
+
+def merge_with_existing_parquet(container_name, blob_name, new_df, dedupe_columns):
+    """
+    Used for fact/history tables.
+
+    Reads the existing curated parquet, appends the new rows, drops duplicates,
+    and overwrites the curated parquet with the combined history.
+    """
+    existing_df = download_parquet_if_exists(container_name, blob_name)
+
+    if existing_df is not None and not existing_df.empty:
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        combined_df = new_df.copy()
+
+    if not combined_df.empty:
+        valid_dedupe_columns = [
+            col for col in dedupe_columns
+            if col in combined_df.columns
+        ]
+
+        if valid_dedupe_columns:
+            combined_df = combined_df.drop_duplicates(
+                subset=valid_dedupe_columns,
+                keep="last"
+            )
+
+    upload_parquet(container_name, blob_name, combined_df)
+    return combined_df
 
 
 def to_decimal(value):
@@ -125,6 +186,27 @@ def to_bool(value):
         return None
 
     return bool(value)
+
+
+def apply_nullable_ints(df, columns):
+    for col in columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+    return df
+
+
+def apply_nullable_floats(df, columns):
+    for col in columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    return df
+
+
+def apply_nullable_bools(df, columns):
+    for col in columns:
+        if col in df.columns:
+            df[col] = df[col].astype("boolean")
+    return df
 
 
 def flatten_vehicles(records):
@@ -208,6 +290,43 @@ def flatten_vehicles(records):
     if not df.empty:
         df = df.drop_duplicates(subset=["VehicleID"], keep="last")
 
+        df = apply_nullable_ints(df, [
+            "VehicleID",
+            "AccountID",
+            "Year",
+            "VehicleStatusID",
+            "VehicleTypeID",
+            "GroupID",
+            "FuelTypeID",
+            "FuelEntriesCount",
+            "ServiceEntriesCount",
+            "ServiceRemindersCount",
+            "IssuesCount",
+            "WorkOrdersCount",
+            "DriverID",
+            "DriverGroupID",
+            "MSRPCents"
+        ])
+
+        df = apply_nullable_floats(df, [
+            "PrimaryMeterValue",
+            "PrimaryMeterUsagePerDay",
+            "InServiceMeterValue",
+            "OutOfServiceMeterValue",
+            "EstimatedServiceMonths",
+            "EstimatedReplacementMileage",
+            "EstimatedResalePrice",
+            "MSRP",
+            "FuelTankCapacity",
+            "EPACombined",
+            "EPACity",
+            "EPAHighway"
+        ])
+
+        df = apply_nullable_bools(df, [
+            "DriverEmployee"
+        ])
+
     return df
 
 
@@ -271,6 +390,34 @@ def flatten_fuel_entries(records):
     if not df.empty:
         df = df.drop_duplicates(subset=["FuelEntryID"], keep="last")
 
+        df = apply_nullable_ints(df, [
+            "FuelEntryID",
+            "VehicleID",
+            "VendorID",
+            "FuelTypeID",
+            "TotalAmountCents",
+            "MeterEntryID",
+            "VehicleYear"
+        ])
+
+        df = apply_nullable_floats(df, [
+            "GallonsUS",
+            "Liters",
+            "PricePerUnit",
+            "TotalAmount",
+            "MPGUS",
+            "CostPerMile",
+            "UsageMiles",
+            "MeterValue"
+        ])
+
+        df = apply_nullable_bools(df, [
+            "Partial",
+            "Personal",
+            "Reset",
+            "MeterVoid"
+        ])
+
     return df
 
 
@@ -331,7 +478,10 @@ def flatten_service_entries(records):
 
         for idx, li in enumerate(line_items, start=1):
             service_task = li.get("service_task") or {}
-            vmrs = li.get("vmrs") or {}
+            vmrs_system_group = li.get("vmrs_system_group") or {}
+            vmrs_system = li.get("vmrs_system") or {}
+            vmrs_assembly = li.get("vmrs_assembly") or {}
+            vmrs_component = li.get("vmrs_component") or {}
 
             line_rows.append({
                 "ServiceEntryID": service_entry_id,
@@ -349,10 +499,10 @@ def flatten_service_entries(records):
                 "PartsCost": to_decimal(li.get("parts_cost")),
                 "Subtotal": to_decimal(li.get("subtotal")),
 
-                "VMRSSystemGroup": vmrs.get("system_group"),
-                "VMRSSystem": vmrs.get("system"),
-                "VMRSAssembly": vmrs.get("assembly"),
-                "VMRSComponent": vmrs.get("component"),
+                "VMRSSystemGroup": vmrs_system_group.get("system_group_name"),
+                "VMRSSystem": vmrs_system.get("system_name"),
+                "VMRSAssembly": vmrs_assembly.get("assembly_name"),
+                "VMRSComponent": vmrs_component.get("component_name"),
 
                 "CuratedAtUTC": datetime.now(timezone.utc).isoformat()
             })
@@ -366,6 +516,29 @@ def flatten_service_entries(records):
             keep="last"
         )
 
+        header_df = apply_nullable_ints(header_df, [
+            "ServiceEntryID",
+            "VehicleID",
+            "VendorID",
+            "MeterEntryID",
+            "VehicleYear"
+        ])
+
+        header_df = apply_nullable_floats(header_df, [
+            "LaborSubtotal",
+            "PartsSubtotal",
+            "Fees",
+            "Tax1",
+            "Tax2",
+            "Subtotal",
+            "TotalAmount",
+            "MeterValue"
+        ])
+
+        header_df = apply_nullable_bools(header_df, [
+            "MeterVoid"
+        ])
+
     if not line_df.empty:
         if "LineItemID" in line_df.columns and line_df["LineItemID"].notna().any():
             line_df = line_df.drop_duplicates(
@@ -377,6 +550,20 @@ def flatten_service_entries(records):
                 subset=["ServiceEntryID", "LineNumber"],
                 keep="last"
             )
+
+        line_df = apply_nullable_ints(line_df, [
+            "ServiceEntryID",
+            "LineNumber",
+            "VehicleID",
+            "LineItemID",
+            "ServiceTaskID"
+        ])
+
+        line_df = apply_nullable_floats(line_df, [
+            "LaborCost",
+            "PartsCost",
+            "Subtotal"
+        ])
 
     return header_df, line_df
 
@@ -415,6 +602,21 @@ def flatten_meter_entries(records):
     if not df.empty:
         df = df.drop_duplicates(subset=["MeterEntryID"], keep="last")
 
+        df = apply_nullable_ints(df, [
+            "MeterEntryID",
+            "VehicleID",
+            "MeterableID",
+            "VehicleYear"
+        ])
+
+        df = apply_nullable_floats(df, [
+            "MeterValue"
+        ])
+
+        df = apply_nullable_bools(df, [
+            "Void"
+        ])
+
     return df
 
 
@@ -429,20 +631,20 @@ def flatten_service_reminders(records):
             "ServiceReminderID": r.get("id"),
             "VehicleID": r.get("vehicle_id") or vehicle.get("id"),
             "ServiceTaskID": r.get("service_task_id") or service_task.get("id"),
-            "ServiceTaskName": service_task.get("name"),
+            "ServiceTaskName": r.get("service_task_name") or service_task.get("name"),
 
-            "DueSoon": r.get("due_soon"),
-            "Overdue": r.get("overdue"),
-            "DueStatus": r.get("due_status"),
+            "DueSoon": 1 if r.get("service_reminder_status_name") == "due_soon" else 0,
+            "Overdue": 1 if r.get("service_reminder_status_name") == "overdue" else 0,
+            "DueStatus": r.get("service_reminder_status_name"),
 
             "MeterInterval": to_decimal(r.get("meter_interval")),
             "TimeInterval": r.get("time_interval"),
             "TimeFrequency": r.get("time_frequency"),
 
             "NextDueMeterValue": to_decimal(r.get("next_due_meter_value")),
-            "NextDueDate": r.get("next_due_date"),
+            "NextDueDate": r.get("next_due_at"),
 
-            "VehicleName": vehicle.get("name"),
+            "VehicleName": r.get("vehicle_name") or vehicle.get("name"),
             "VehicleYear": vehicle.get("year"),
             "VehicleMake": vehicle.get("make"),
             "VehicleModel": vehicle.get("model"),
@@ -458,10 +660,25 @@ def flatten_service_reminders(records):
     if not df.empty:
         df = df.drop_duplicates(subset=["ServiceReminderID"], keep="last")
 
+        df = apply_nullable_ints(df, [
+            "ServiceReminderID",
+            "VehicleID",
+            "ServiceTaskID",
+            "DueSoon",
+            "Overdue",
+            "TimeInterval",
+            "VehicleYear"
+        ])
+
+        df = apply_nullable_floats(df, [
+            "MeterInterval",
+            "NextDueMeterValue"
+        ])
+
     return df
 
 
-def process_endpoint(endpoint_name, file_name, flatten_func, output_name):
+def process_endpoint(endpoint_name, file_name, flatten_func, output_name, merge_history=False, dedupe_columns=None):
     latest_blob = get_latest_blob(
         RAW_CONTAINER,
         endpoint_name,
@@ -476,6 +693,79 @@ def process_endpoint(endpoint_name, file_name, flatten_func, output_name):
 
     output_blob = f"{output_name}/{output_name}.parquet"
 
+    if merge_history:
+        merged_df = merge_with_existing_parquet(
+            CURATED_CONTAINER,
+            output_blob,
+            df,
+            dedupe_columns or []
+        )
+
+        row_count = len(merged_df)
+    else:
+        upload_parquet(
+            CURATED_CONTAINER,
+            output_blob,
+            df
+        )
+
+        row_count = len(df)
+
+    return {
+        "endpoint": endpoint_name,
+        "source_blob": latest_blob,
+        "output_blob": output_blob,
+        "rows": row_count,
+        "new_rows": len(df),
+        "merge_history": merge_history
+    }
+
+
+
+def process_historical_endpoint_all_blobs(endpoint_name, file_name, flatten_func, output_name, dedupe_columns):
+    """
+    Used for historical fact tables.
+
+    Reads all raw JSON blobs for the endpoint, combines all records, flattens,
+    dedupes, and overwrites the curated parquet with the full historical table.
+
+    This preserves the original backfill plus all later daily files.
+    """
+    blobs = get_all_blobs(
+        RAW_CONTAINER,
+        endpoint_name,
+        file_name
+    )
+
+    logging.info("Reading %s raw blobs for %s", len(blobs), endpoint_name)
+
+    all_records = []
+
+    for blob_name in blobs:
+        logging.info("Reading raw blob: %s", blob_name)
+        records = download_json(RAW_CONTAINER, blob_name)
+
+        if isinstance(records, list):
+            all_records.extend(records)
+        else:
+            logging.warning("Skipping non-list JSON payload in blob: %s", blob_name)
+
+    df = flatten_func(all_records)
+
+    if not df.empty:
+        valid_dedupe_columns = [
+            col for col in dedupe_columns
+            if col in df.columns
+        ]
+
+        if valid_dedupe_columns:
+            df = df.drop_duplicates(
+                subset=valid_dedupe_columns,
+                keep="last"
+            )
+
+    output_blob = f"{output_name}/{output_name}.parquet"
+
     upload_parquet(
         CURATED_CONTAINER,
         output_blob,
@@ -484,24 +774,31 @@ def process_endpoint(endpoint_name, file_name, flatten_func, output_name):
 
     return {
         "endpoint": endpoint_name,
-        "source_blob": latest_blob,
+        "source_blob": "ALL",
         "output_blob": output_blob,
-        "rows": len(df)
+        "rows": len(df),
+        "raw_blob_count": len(blobs),
+        "merge_history": True
     }
 
 
 def process_service_entries():
-    latest_blob = get_latest_blob(
+    blobs = get_all_blobs(
         RAW_CONTAINER,
         "service_entries",
         "service_entries.json"
     )
 
-    logging.info("Reading latest raw blob: %s", latest_blob)
+    logging.info("Reading %s service entry raw blobs", len(blobs))
 
-    records = download_json(RAW_CONTAINER, latest_blob)
+    all_records = []
 
-    header_df, line_df = flatten_service_entries(records)
+    for blob_name in blobs:
+        logging.info("Reading raw blob: %s", blob_name)
+        records = download_json(RAW_CONTAINER, blob_name)
+        all_records.extend(records)
+
+    header_df, line_df = flatten_service_entries(all_records)
 
     upload_parquet(
         CURATED_CONTAINER,
@@ -517,9 +814,11 @@ def process_service_entries():
 
     return {
         "endpoint": "service_entries",
-        "source_blob": latest_blob,
+        "source_blob": "ALL",
         "service_entry_rows": len(header_df),
-        "service_line_rows": len(line_df)
+        "service_line_rows": len(line_df),
+        "raw_blob_count": len(blobs),
+        "merge_history": True
     }
 
 
@@ -528,41 +827,49 @@ def main():
 
     results = []
 
+    # Dimension/current-state table. Overwrite each run.
     results.append(
         process_endpoint(
             endpoint_name="vehicles",
             file_name="vehicles.json",
             flatten_func=flatten_vehicles,
-            output_name="dim_vehicle"
+            output_name="dim_vehicle",
+            merge_history=False
         )
     )
 
+    # Historical fact table. Read all raw blobs: original backfill + daily files.
     results.append(
-        process_endpoint(
+        process_historical_endpoint_all_blobs(
             endpoint_name="fuel_entries",
             file_name="fuel_entries.json",
             flatten_func=flatten_fuel_entries,
-            output_name="fact_fuel_entry"
+            output_name="fact_fuel_entry",
+            dedupe_columns=["FuelEntryID"]
         )
     )
 
     results.append(process_service_entries())
 
+    # Historical fact table. Read all raw blobs: original backfill + daily files.
     results.append(
-        process_endpoint(
+        process_historical_endpoint_all_blobs(
             endpoint_name="meter_entries",
             file_name="meter_entries.json",
             flatten_func=flatten_meter_entries,
-            output_name="fact_meter_entry"
+            output_name="fact_meter_entry",
+            dedupe_columns=["MeterEntryID"]
         )
     )
 
+    # Reminder table is current state. Overwrite each run.
     results.append(
         process_endpoint(
             endpoint_name="service_reminders",
             file_name="service_reminders.json",
             flatten_func=flatten_service_reminders,
-            output_name="fact_service_reminder"
+            output_name="fact_service_reminder",
+            merge_history=False
         )
     )
 
